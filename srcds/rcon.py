@@ -42,7 +42,7 @@ def ParsePacket(data):
     body = data[struct.calcsize('<3i'):][:-2]
     return RconPacket(pkt_id, pkt_type, body)
 
-class RCON_Server(object):
+class RconConnection(object):
 
     def __init__(self, server, port, password=None):
         """Construct an RconConnection.
@@ -148,10 +148,10 @@ Impliment:
 
 #                   HOW TO USE
 """   
-rcon = RCON_Server("192.168.0.12", 25575, "pro")
+rcon = RconConnection("192.168.0.12", 25575, "pro")
                     #SERVER IP     PORT   PASSWORD
 
-                    #RCON_Server will Authenticate or raise a PermissionError
+                    #RconConnection will Authenticate or raise a PermissionError
 
 
 while True:         #LOOP

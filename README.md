@@ -33,15 +33,21 @@ RCON Usage
 ```python
 from srcds.rcon import RconConnection
 
-conn = RconConnection('127.0.0.1', port=27015, password='password')
-response = conn.exec_command('status')
-# Response content can be accessed via str(response) or response.body
-# Response content will be a utf-8 encoded string in most cases, but it may depend on the
-# server type.
+rcon = RconConnection("192.168.0.12", 25575, "pro")
+                    #SERVER IP     PORT   PASSWORD
 
-# For servers that do not support multipart RCON responses like factorio,
-# enable the single_packet_mode option
-factorio_conn = RconConnection('127.0.0.1', single_packet_mode=True)
+                    #RconConnection will Authenticate or raise a PermissionError
+
+
+while True:         #LOOP
+    ret, resp = rcon.Command(input("Command:"))
+                    # rcon.Command will take in a command, if the command isn't answered ret will be false and resp will be None
+    if ret:         # Check is ret is True
+        print(resp) # Print the responce
+    else:
+        print("Command didn't give response")
+                    # Alert the user the command didn't return a response
+
 ```
 
 License
