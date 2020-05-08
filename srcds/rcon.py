@@ -1,29 +1,29 @@
-# Copyright (C) 2013 Peter Rowlands
-"""Source server RCON communications module"""
-
 import struct
-import socket
-import itertools
+import time
+from essentials import socket_ops_v2
 
 
 # Packet types
 SERVERDATA_AUTH = 3
 SERVERDATA_AUTH_RESPONSE = 2
+SERVERDATA_AUTH_FAILED_RESPONSE = -1
 SERVERDATA_EXECCOMMAND = 2
 SERVERDATA_RESPONSE_VALUE = 0
-
 
 class RconPacket(object):
     """RCON packet"""
 
-    def __init__(self, pkt_id=0, pkt_type=-1, body=''):
+    def __init__(self, pkt_id=0, pkt_type=-1, body=b''):
         self.pkt_id = pkt_id
         self.pkt_type = pkt_type
         self.body = body
 
     def __str__(self):
         """Return the body string."""
-        return self.body
+        try:
+            return self.body.decode()
+        except:
+            return self.body
 
     def size(self):
         """Return the pkt_size field for this packet."""
@@ -35,139 +35,131 @@ class RconPacket(object):
                            self.size(), self.pkt_id, self.pkt_type,
                            bytearray(self.body, 'utf-8'))
 
+def ParsePacket(data):
+    """Read one RCON packet"""
+    header = data[:struct.calcsize('<3i')]
+    (_, pkt_id, pkt_type) = struct.unpack('<3i', header)
+    body = data[struct.calcsize('<3i'):][:-2]
+    return RconPacket(pkt_id, pkt_type, body)
 
-class RconConnection(object):
-    """RCON client to server connection"""
+class RCON_Server(object):
 
-    def __init__(self, server, port=27015, password='', single_packet_mode=False):
+    def __init__(self, server, port, password=None):
         """Construct an RconConnection.
 
         Parameters:
             server (str) server hostname or IP address
             port (int) server port number
             password (str) server RCON password
-            single_packet_mode (bool) set to True for servers which do not hand 0-length SERVERDATA_RESPONSE_VALUE
-                requests (i.e. Factorio).
 
         """
+
+        self.pk_id = 1
+        self.open_requests = {}
         self.server = server
         self.port = port
-        self.single_packet_mode = single_packet_mode
-        self._sock = socket.create_connection((server, port))
-        self.pkt_id = itertools.count(1)
-        self._authenticate(password)
+        self.password = password
+        self.con = socket_ops_v2.Socket_Connector(server, port)
+        self.con.configuration.LEGACY = True
+        self.con.configuration.on_data_recv = self.__match_response__
+        def con_closed():
+            print("RCON Server Closed")
+        self.con.configuration.on_connection_close = con_closed
+        self.con.connect()
+        if password is not None:
+            self.authenticated = None
+            self.Authenticate()
+        else:
+            self.authenticated = False
 
-    def _authenticate(self, password):
-        """Authenticate with the server using the given password."""
-        auth_pkt = RconPacket(next(self.pkt_id), SERVERDATA_AUTH, password)
-        self._send_pkt(auth_pkt)
-        # The server should respond with a SERVERDATA_RESPONSE_VALUE followed by SERVERDATA_AUTH_RESPONSE.
-        # Note that some server types omit the initial SERVERDATA_RESPONSE_VALUE packet.
-        auth_resp = self.read_response(auth_pkt)
-        if auth_resp.pkt_type == SERVERDATA_RESPONSE_VALUE:
-            auth_resp = self.read_response()
-        if auth_resp.pkt_type != SERVERDATA_AUTH_RESPONSE:
-            raise RconError('Received invalid auth response packet')
-        if auth_resp.pkt_id == -1:
-            raise RconAuthError('Bad password')
+    def __match_response__(self, data):
+        """Matches incoming data to Command requests and Authentication Requests
 
-    def exec_command(self, command):
+        You'll not need this
+        """
+        parsed = ParsePacket(data)
+        if parsed.pkt_id in self.open_requests:
+            self.open_requests[parsed.pkt_id] = data
+        elif parsed.pkt_id == SERVERDATA_AUTH_FAILED_RESPONSE:
+            print("[ SERVER ] Authentication: Failed")
+            self.con.shutdown()
+            self.authenticated = False
+        elif parsed.pkt_type == SERVERDATA_AUTH_RESPONSE:
+            print("[ SERVER ] Authentication: Passed")
+            self.authenticated = True
+        
+    def Command(self, command, timeout=10):
         """Execute the given RCON command.
 
         Parameters:
             command (str) the RCON command string (ex. "status")
+            timeout (int) how long to wait before the function return None
 
         Returns the response body
         """
-        cmd_pkt = RconPacket(next(self.pkt_id), SERVERDATA_EXECCOMMAND,
-                             command)
-        self._send_pkt(cmd_pkt)
-        resp = self.read_response(cmd_pkt, True)
-        return resp.body
+        tk = int(self.pk_id)
+        self.open_requests[tk] = None
+        self.con.send(RconPacket(tk, SERVERDATA_EXECCOMMAND, command).pack())
+        if self.pk_id > 200:
+            self.pk_id = 0
+        self.pk_id += 1
+        tm_out = 0
+        while tm_out < timeout and self.open_requests[tk] == None:
+            tm_out += 0.05
+            time.sleep(0.05)
 
-    def _send_pkt(self, pkt):
-        """Send one RCON packet over the connection.
-
-            Raises:
-                RconSizeError if the size of the specified packet is > 4096 bytes
-        """
-        if pkt.size() > 4096:
-            raise RconSizeError('pkt_size > 4096 bytes')
-        data = pkt.pack()
-        self._sock.sendall(data)
-
-    def _recv_pkt(self):
-        """Read one RCON packet"""
-        while True:
-            header = self._sock.recv(struct.calcsize('<3i'))
-            if len(header) != 0:
-                break
-
-        (pkt_size, pkt_id, pkt_type) = struct.unpack('<3i', header)
-        body = self._sock.recv(pkt_size - 8)
-        return RconPacket(pkt_id, pkt_type, body)
-
-    def read_response(self, request=None, multi=False):
-        """Return the next response packet.
-
-        Parameters:
-            request (RconPacket) if request is provided, read_response() will check that the response ID matches the
-                specified request ID
-            multi (bool) set to True if read_response() should check for a multi packet response. If the current
-                RconConnection has single_packet_mode enabled, this parameter is ignored.
-
-        Raises:
-            RconError if an error occurred while receiving the server response
-        """
-        if request and not isinstance(request, RconPacket):
-            raise TypeError('Expected RconPacket type for request')
-        if not self.single_packet_mode and multi:
-            if not request:
-                raise ValueError('Must specify a request packet in order to'
-                                 ' read a multi-packet response')
-            response = self._read_multi_response(request)
+        if self.open_requests[tk] is None:
+            del self.open_requests[tk]
+            return False, None
         else:
-            response = self._recv_pkt()
-        if not self.single_packet_mode and response.pkt_type not in (SERVERDATA_RESPONSE_VALUE, SERVERDATA_AUTH_RESPONSE):
-            raise RconError('Recieved unexpected RCON packet type')
-        if request and response.pkt_id != request.pkt_id:
-            raise RconError('Response ID does not match request ID')
-        return response
+            packet = ParsePacket(self.open_requests[tk])
+            del self.open_requests[tk]
+            return not tm_out >= timeout, packet
 
-    def _read_multi_response(self, req_pkt):
-        """Return concatenated multi-packet response."""
-        chk_pkt = RconPacket(next(self.pkt_id), SERVERDATA_RESPONSE_VALUE)
-        self._send_pkt(chk_pkt)
-        # According to the Valve wiki, a server will mirror a
-        # SERVERDATA_RESPONSE_VALUE packet and then send an additional response
-        # packet with an empty body. So we should concatenate any packets until
-        # we receive a response that matches the ID in chk_pkt
-        body_parts = []
-        while True:
-            response = self._recv_pkt()
-            if response.pkt_type != SERVERDATA_RESPONSE_VALUE:
-                raise RconError('Received unexpected RCON packet type')
-            if response.pkt_id == chk_pkt.pkt_id:
-                break
-            elif response.pkt_id != req_pkt.pkt_id:
-                raise RconError('Response ID does not match request ID')
-            body_parts.append(response.body)
-        # Read and ignore the extra empty body response
-        self._recv_pkt()
-        return RconPacket(req_pkt.pkt_id, SERVERDATA_RESPONSE_VALUE,
-                          ''.join(str(body_parts)))
+    def Authenticate(self):
+        """ Self Authenticating Function, You can use this to Reauthenticate.
+        
+        Returns:
+            True on Authentication Success
+        Raises:
+            PermissionError if Authentication Failure
+        """
+        self.con.send(RconPacket(self.pk_id, SERVERDATA_AUTH, self.password).pack())
+        tm_out = 0
+        while tm_out < 10 and self.authenticated is None:
+            tm_out += 0.05
+            time.sleep(0.05)
+        if self.authenticated != True:
+            raise PermissionError("Authentication Failed")
+        return True
 
 
-class RconError(Exception):
-    """Generic RCON error."""
-    pass
+#                   TODO
+"""
+Impliment:
+
+    _read_multi_response
+
+    single_packet_mode (bool) set to True for servers which do not hand 0-length SERVERDATA_RESPONSE_VALUE
+                requests (i.e. Factorio).
+
+"""
 
 
-class RconAuthError(RconError):
-    """Raised if an RCON Authentication error occurs."""
-    pass
+#                   HOW TO USE
+"""   
+rcon = RCON_Server("192.168.0.12", 25575, "pro")
+                    #SERVER IP     PORT   PASSWORD
+
+                    #RCON_Server will Authenticate or raise a PermissionError
 
 
-class RconSizeError(RconError):
-    """Raised when an RCON packet is an illegal size."""
-    pass
+while True:         #LOOP
+    ret, resp = rcon.Command(input("Command:"))
+                    # rcon.Command will take in a command, if the command isn't answered ret will be false and resp will be None
+    if ret:         # Check is ret is True
+        print(resp) # Print the responce
+    else:
+        print("Command didn't give response")
+                    # Alert the user the command didn't return a response
+"""
